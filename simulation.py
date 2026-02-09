@@ -39,6 +39,14 @@ class AdvancedSim:
         self.total_conflicts = 0  # 全局冲突计数器
         self.safety_threshold = 2.0  # 定义危险距离（米）：小于2米视为冲突
 
+        self.config = {
+            "car_max_v": 25.0,  # 红车最大速度
+            "truck_max_v": 15.0,  # 蓝车最大速度
+            "safe_gap": 40.0,  # 基础安全跟车距离 (像素)
+            "yield_angle": 1,  # 入场礼让判定弧度 (越大越保守)
+            "spawn_rate": 0.5  # 车辆生成频率
+        }
+
     def spawn_vehicle(self):
         # 1. 随机选择一个入口角度 (0, pi/2, pi, 3pi/2)
         selected_angle = random.choice(self.directions)
@@ -147,6 +155,13 @@ class AdvancedSim:
 
         return v.visual_x, v.visual_y
 
+    def get_avg_speed(self):
+        """计算当前场上所有车辆的平均速度"""
+        if not self.vehicles:
+            return 0.0
+        total_speed = sum(v.v for v in self.vehicles)
+        return total_speed / len(self.vehicles)
+
     def update(self):
         R = 120
         DT = 0.02
@@ -155,31 +170,46 @@ class AdvancedSim:
             # --- 1. 获取前车 ---
             lead_v = self.get_lead_vehicle(v)
             actual_gap = 1000
+            # 动态获取当前车辆类型的最高速和推力
+            max_speed = self.config["car_max_v"] if v.type == 'car' else self.config["truck_max_v"]
+            accel_power = 1.2 if v.type == 'car' else 0.6
+            # 环岛内速度通常略低于直行速度
+            max_ring_v = max_speed * 0.7
+
             # --- 2. 状态：APPROACHING (引道) ---
             if v.state == "APPROACHING":
+                is_blocked_front = False
+                # 1. 检测环岛内是否有车正挡在你的入口切入点
+                for other in self.vehicles:
+                    if other.state == "CIRCULATING":
+                        # 计算这辆环岛车距离你“预定切入位置”的角度差
+                        # 如果角度差非常小（比如 < 0.3），说明入口被堵住了
+                        d_angle_entry = (v.start_angle - other.current_angle) % (2 * np.pi)
+                        if d_angle_entry < 0.3 or d_angle_entry > (2 * np.pi - 0.1):
+                            is_blocked_front = True
+                            break
+
                 is_blocked_by_ring = False
                 if v.dist_to_center < R + 70:
                     for other in self.vehicles:
                         if other.state == "CIRCULATING":
                             d_angle = (v.start_angle - other.current_angle) % (2 * np.pi)
-                            if 0.05 < d_angle < 0.9 or d_angle > (2 * np.pi - 0.2):
-                                is_blocked_by_ring = True
+                            if 0.05 < d_angle < self.config["yield_angle"] or d_angle > (2 * np.pi - 0.2):
                                 is_blocked_by_ring = True
                                 break
-                if (v.dist_to_center <= R + 45 and is_blocked_by_ring):
+
+                should_stop = is_blocked_by_ring or is_blocked_front
+                if (v.dist_to_center <= R + 45 and should_stop):
                     v.v = 0  # 停下
                 else:
-                    stop_line = R + 60
-                    # gap = (v.dist_to_center - lead_v.dist_to_center) if (lead_v and lead_v.state == "APPROACHING") else 1000
-
-                    if v.v < 1.0: v.wait_time += DT
-
+                    stop_line = R + 45
+                    # if v.v < 1.0: v.wait_time += DT
                     # --- 物理逻辑控制：If (停) Else (冲) ---
                     if (v.dist_to_center <= stop_line and is_blocked_by_ring):
                         v.v = 0
                         v.a = 0
                         if is_blocked_by_ring: v.dist_to_center = stop_line
-                    elif lead_v and lead_v.state == "APPROACHING" and (v.dist_to_center - lead_v.dist_to_center) < 40:
+                    elif lead_v and lead_v.state == "APPROACHING" and (v.dist_to_center - lead_v.dist_to_center) < self.config["safe_gap"]:
                         v.v = 0
                         v.a = 0
                     else:
@@ -211,9 +241,10 @@ class AdvancedSim:
                         v.dist_to_center -= v.v * DT
 
                     # 状态切换：确保切换瞬间不漂移
-                    if v.dist_to_center <= R + 30:
+                    if v.dist_to_center <= R + 20:
                         last_x, last_y = self.get_coords(v)
                         v.state = "CIRCULATING"
+                        v.dist_to_center = R
                         v.current_angle = v.start_angle
                         v.visual_x, v.visual_y = last_x, last_y
 
@@ -222,14 +253,13 @@ class AdvancedSim:
                 # --- [修复 A] 强力向心力：把车“焊”在 R=120 的轨道上 ---
                 # 这里的修正必须足够快，才能抵消状态切换时的位移惯性
                 # 我们用 0.15 的权重，让它在 3-5 帧内迅速回正
-                v.dist_to_center += (R - v.dist_to_center) * 0.01
+                v.dist_to_center += (R - v.dist_to_center) * 0.02
 
                 # 2. 寻找环岛内的前车 (同在环岛内的车)
                 ring_lead = None
                 min_ring_dist = 1000
                 for other in self.vehicles:
                     if other.id == v.id: continue
-
                     # 只有对方也在环岛内，或者正在退出时，才真正执行“跟车”
                     if other.state in ["CIRCULATING", "EXITING"]:
                         d_angle = (v.current_angle - other.current_angle) % (2 * np.pi)
@@ -238,15 +268,33 @@ class AdvancedSim:
                             min_ring_dist = dist
                             ring_lead = other
 
-                    if ring_lead and min_ring_dist < 40:
-                        if min_ring_dist < 20:
-                            v.v = 0
+                    ring_safe_gap = self.config['safe_gap']
+                    # if ring_lead and min_ring_dist < self.config["safe_gap"]:
+                    #     if min_ring_dist < 25:
+                    #         v.v = 0
+                    #     else:
+                    #         v.v = v.v * 0.8  # 蠕动，不完全停死
+                    # else:
+                    #     # 只要前面没车，强制加速，不准在环岛里发呆
+                    #     max_ring_v = 18 if v.type == 'car' else 12
+                    #     v.v = min(v.v + 0.8, max_ring_v)
+                    if ring_lead:
+                        # 动态安全距离：速度越快，需要的间距越大
+                        # 这里我们让它比配置的 safe_gap 更灵敏一点
+                        target_gap = self.config['safe_gap'] + (v.v * 0.8)
+
+                        if min_ring_dist < target_gap:
+                            ratio = max(0, min_ring_dist / target_gap)
+                            # 线性减速：距离越近，速度越慢，而不是直接变 0
+                            target_v = max_ring_v * (ratio ** 2)
+                            v.v = v.v * 0.4 + target_v * 0.6  # 平滑过渡
+
+                            if min_ring_dist < 25: v.v = 0  # 实在太近才停
                         else:
-                            v.v = 2.0  # 蠕动，不完全停死
+                            v.v = min(v.v + 1.2, max_ring_v)  # 没车就快跑！
                     else:
-                        # 只要前面没车，强制加速，不准在环岛里发呆
-                        max_ring_v = 18 if v.type == 'car' else 12
-                        v.v = min(v.v + 0.8, max_ring_v)
+                        v.v = min(v.v + 1.5, max_ring_v)  # 环岛内加速要果断
+
                     # 情况1：前方也是环岛车
                     if other.state == "CIRCULATING":
                         d_angle = (v.current_angle - other.current_angle) % (2 * np.pi)
@@ -267,14 +315,8 @@ class AdvancedSim:
 
                 # --- 速度控制逻辑 (保持不变) ---
                 max_ring_v = 18 if v.type == 'car' else 12
-                if ring_lead and min_ring_dist < 40:
-                    # if min_ring_dist < 25:  # 离正在出去的车太近了，减速
-                    #     v.v = v.v * 0.5
-                    #     if min_ring_dist < 30: v.v = 0
-                    # else:
-                    #     target_ring_v = max(2, (min_ring_dist - 30) / 100 * max_ring_v)
-                    #     v.v = v.v * 0.6 + target_ring_v * 0.4
-                    if min_ring_dist < 25:  # 只有快贴上了才停
+                if ring_lead and min_ring_dist < self.config["safe_gap"]:
+                    if min_ring_dist < 20:  # 只有快贴上了才停
                         v.v = 0
                     else:
                         v.v = 2.0  # 给个保底蠕动速度，防止彻底卡死
@@ -308,7 +350,7 @@ class AdvancedSim:
 
                 if exit_lead:
                     gap = exit_lead.dist_to_center - v.dist_to_center
-                    if gap < 45:
+                    if gap < self.config["safe_gap"] + 5:
                         v.v = 0  # 别撞上前面的退出车
                     else:
                         v.v = min(base_exit_v, (gap - 35) / 60 * base_exit_v)
@@ -323,28 +365,33 @@ class AdvancedSim:
                     })
                     self.vehicles.remove(v)
 
-            # --- 重点：就在这里插入 [暴力解死锁] ---
+            # --- 5. 全局补丁：暴力解重叠 ---
             # 此时 v 的速度 v.v 已经被上面的逻辑算好了，我们现在检查是否重叠
             for other in self.vehicles:
-                if v.id == other.id: continue
-                if v.visual_x is None or other.visual_x is None:
+                if v.id == other.id or v.visual_x is None or other.visual_x is None:
                     continue
+
                 # 计算物理距离或角度差
                 # 如果两车距离过近（比如小于 15 像素）
                 dx = v.visual_x - other.visual_x
                 dy = v.visual_y - other.visual_y
-                if (dx ** 2 + dy ** 2) < 225:  # 15像素的平方
-                    if v.state == "CIRCULATING":
+                if (dx ** 2 + dy ** 2) < 900:  # 30像素的平方
+                    if v.state == "CIRCULATING" and other.state == "CIRCULATING":
                         # 强制给环岛内的车一个推力，让它离开重叠区
-                        v.v = max(v.v, 5.0)
+                        v.v = max(v.v, 8.0)
                         # 同时也让它移动，防止位移跳变
                         angular_speed = v.v / v.dist_to_center
                         v.current_angle -= angular_speed * DT
+                        # d_angle = (v.current_angle - other.current_angle) % (2 * np.pi)
+                        # if d_angle < np.pi:  # v 在 other 后面
+                        #     v.v *= 0.8
+                        # else:  # v 在 other 前面
+                        #     v.v = max(v.v, 6.0)
 
             if v.wait_time > 20 and v.v < 0.1:
                 v.v = 2.0
                 v.wait_time = 0  # 重置计数，给它推一把
-            # 冲突检测
+            # --- 6. 幽灵死锁救援与冲突检测 ---
             if lead_v and v.v > 0.5:
                 current_gap = actual_gap if v.state == "APPROACHING" else abs(v.current_angle - lead_v.current_angle) * R
                 if current_gap < 20:
@@ -469,6 +516,31 @@ class AdvancedSim:
 
             self.screen.blit(rotated_car, rect)
 
+    def draw_dashboard(self, screen):
+        # 1. 绘制背景板
+        overlay = pygame.Surface((300, 220))
+        overlay.set_alpha(180)
+        overlay.fill((40, 40, 40))
+        screen.blit(overlay, (10, 10))
+
+        # 2. 显示实时指标
+        font = pygame.font.SysFont("Arial", 18)
+        stats = [
+            f"Total Conflicts: {self.total_conflicts}",
+            f"Active Vehicles: {len(self.vehicles)}",
+            f"Avg Speed: {self.get_avg_speed():.1f}",
+            "-----------------------",
+            f"[1/2] Car Max V: {self.config['car_max_v']}",
+            f"[3/4] Safe Gap: {self.config['safe_gap']}",
+            f"[5/6] Yield Angle: {self.config['yield_angle']:.1f}",
+            "Press keys to adjust values"
+        ]
+
+        for i, text in enumerate(stats):
+            color = (255, 255, 255) if i < 4 else (0, 255, 127)
+            txt_surface = font.render(text, True, color)
+            screen.blit(txt_surface, (20, 20 + i * 25))
+
     def export_data(self):
         """将所有统计数据导出为 CSV"""
         # 合并数据：已离开的车辆 + 当前还在场上的车辆
@@ -499,37 +571,63 @@ class AdvancedSim:
         except PermissionError:
             print("错误：无法保存文件。请检查 CSV 文件是否被 Excel 打开了？")
 
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                print("正在自动保存数据...")
+                self.export_data()
+                self.running = False  # 确保类里有 self.running 属性
+
+            if event.type == pygame.KEYDOWN:
+                # S 键保存数据
+                if event.key == pygame.K_s:
+                    self.export_data()
+
+                # --- 实验参数实时调整 ---
+                # 1 & 2: 调整最高速
+                if event.key == pygame.K_1:
+                    self.config['car_max_v'] += 2
+                elif event.key == pygame.K_2:
+                    self.config['car_max_v'] = max(10, self.config['car_max_v'] - 2)
+
+                # 3 & 4: 调整安全跟车距离
+                elif event.key == pygame.K_3:
+                    self.config['safe_gap'] += 5
+                elif event.key == pygame.K_4:
+                    self.key_3_4_logic = True  # 标记位（可选）
+                    self.config['safe_gap'] = max(20, self.config['safe_gap'] - 5)
+
+                # 5 & 6: 调整礼让角度 (敏感度)
+                elif event.key == pygame.K_5:
+                    self.config['yield_angle'] += 0.1
+                elif event.key == pygame.K_6:
+                    self.config['yield_angle'] = max(0.5, self.config['yield_angle'] - 0.1)
+
     def run(self):
-        clock = pygame.time.Clock()
+        # 移除多余的 clock = pygame.time.Clock()，使用 self.clock
         running = True
         while running:
-            # 强制每秒只更新 60 次
-            clock.tick(60)
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    # 关键：点击关闭窗口时，先保存数据再退出
-                    print("正在自动保存数据...")
-                    self.export_data()
-                    running = False
+            # 1. 专门处理所有输入事件
+            self.handle_events()
 
-                # 手动触发：按下 S 键
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_s:
-                        self.export_data()
-
-            # ... 原有的 spawn, update, draw 逻辑 ...
+            # 2. 车辆生成逻辑
             self.spawn_timer += 1
             if self.spawn_timer > 15:
                 self.spawn_vehicle()
                 self.spawn_timer = 0
 
+            # 3. 物理逻辑更新
             self.update()
-            self.draw()
+
+            # 4. 绘图渲染
+            self.draw()  # 画背景、道路和车辆
+            self.draw_dashboard(self.screen)  # 在最上层画仪表盘
+
+            # 5. 刷新屏幕
             pygame.display.flip()
-            self.clock.tick(FPS)
+            self.clock.tick(60)
 
         pygame.quit()
-
 
 if __name__ == "__main__":
     sim = AdvancedSim()
