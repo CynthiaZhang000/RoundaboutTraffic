@@ -63,12 +63,28 @@ class Vehicle:
         # 限制范围，不让车倒退，也不让它加速过猛
         return max(-self.b * 2, min(self.a, total_accel))
 
-    def get_bezier_path(start_pos, control_pos, end_pos, steps=15):
-        """生成贝塞尔曲线上的点列表"""
-        path = []
-        for t in np.linspace(0, 1, steps):
-            # 二次贝塞尔曲线公式: (1-t)^2*P0 + 2t(1-t)*P1 + t^2*P2
-            x = (1 - t) ** 2 * start_pos[0] + 2 * (1 - t) * t * control_pos[0] + t ** 2 * end_pos[0]
-            y = (1 - t) ** 2 * start_pos[1] + 2 * (1 - t) * t * control_pos[1] + t ** 2 * end_pos[1]
-            path.append((x, y))
-        return path
+    def get_bezier_point(self, p0, p1, p2, t):
+        """
+        二次贝塞尔曲线公式
+        p0: 起点 (引道停止线)
+        p1: 控制点 (弯角处)
+        p2: 终点 (环岛切入点)
+        """
+        return (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t ** 2 * p2
+
+    def generate_entry_path(self, start_pos, entry_angle, R, center=(400, 400)):
+        """生成从引道进入环岛的弧线点位"""
+        # 终点：环岛轨道上的切入点
+        end_pos = np.array([
+            center[0] + R * np.cos(entry_angle),
+            center[1] + R * np.sin(entry_angle)
+        ])
+
+        # 控制点：取引道延长线与环岛切线的交点附近
+        # 这里简单处理：取起点和终点坐标的混合
+        p0 = np.array(start_pos)
+        p2 = end_pos
+        p1 = np.array([p0[0] if abs(p0[0] - 400) > abs(p0[1] - 400) else p2[0],
+                       p0[1] if abs(p0[1] - 400) > abs(p0[1] - 400) else p2[1]])
+
+        return [self.get_bezier_point(p0, p1, p2, t) for t in np.linspace(0, 1, 10)]
