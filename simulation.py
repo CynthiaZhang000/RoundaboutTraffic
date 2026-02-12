@@ -40,6 +40,9 @@ class AdvancedSim:
         self.total_conflicts = 0  # 全局冲突计数器
         self.safety_threshold = 2.0  # 定义危险距离（米）：小于2米视为冲突
 
+        self.weight_aggressive = 5  # 激进车初始权重
+        self.weight_conservative = 5  # 保守车初始权重
+
         self.config = {
             "car_max_v": 25.0,  # 红车最大速度
             "truck_max_v": 15.0,  # 蓝车最大速度
@@ -48,44 +51,56 @@ class AdvancedSim:
             "spawn_rate": 0.5  # 车辆生成频率
         }
 
+        # 数据统计容器
+        self.stats_travel_times = []  # 存储每张车完成通行的总时间
+        self.stats_conflicts = []  # 存储所有冲突点的坐标 (x, y)
+        self.stats_flow_data = []  # 存储 (当前车数, 瞬时效率/吞吐量)
+        self.stat_timer = 0
+
     def spawn_vehicle(self):
-        # 1. 随机选择一个入口角度 (0, pi/2, pi, 3pi/2)
-        selected_angle = random.choice(self.directions)
-        if len(self.vehicles) >= 15:
+        # 1. 总数限制：场上总车数不超 25 (环岛15 + 4路口*2-3辆)
+        if len(self.vehicles) >= 25:
             return
-        # 2. 安全检查：防止在同一个入口瞬间生成两辆重合的车
-        # 检查在该入口引道末端（ROAD_LEN + R 附近）是否已经有车
+
+        # 计算当前的概率分布
+        total_w = self.weight_aggressive + self.weight_conservative
+        if total_w == 0: return  # 防止除以0
+
+        prob_agg = self.weight_aggressive / total_w
+
+        # 抽签决定车型
+        v_type = "aggressive" if random.random() < prob_agg else "conservative"
+
+        # 2. 统计每个路口排队的人数
+        lane_counts = {angle: 0 for angle in self.directions}
+        for v in self.vehicles:
+            if v.state == "APPROACHING":
+                lane_counts[v.start_angle] += 1
+
+        # 3. 找出目前排队最少的路口，且排队不能超过 5 辆
+        available_lanes = [ang for ang, count in lane_counts.items() if count < 8]
+        if not available_lanes:
+            return
+
+        selected_angle = random.choice(available_lanes)
+
+        # 4. 安全间距检查：该路口最后一张车后方是否有位置
         too_close = any(
-            v.dist_to_center > (ROAD_LEN + R - 40)
+            v.dist_to_center > (ROAD_LEN + R - 50)
             for v in self.vehicles
             if v.state == "APPROACHING" and v.start_angle == selected_angle
         )
 
         if not too_close:
-            # 3. 确定驾驶员类型（你可以根据研究需要调整这个比例）
-            v_type = random.choices(["aggressive", "conservative"], weights=[0.3, 0.7])[0]
-
-            # 4. 实例化车辆
+            v_type = random.choices(["aggressive", "conservative"], weights=[0.4, 0.6])[0]
             v = Vehicle(random.randint(1000, 9999), v_type)
-
-            # 5. 初始化路径与状态属性
             v.state = "APPROACHING"
             v.start_angle = selected_angle
-            # 随机选择一个不等于入口的出口角度
             v.end_angle = random.choice([a for a in self.directions if a != selected_angle])
-
-            # 初始距离：引道尽头
             v.dist_to_center = ROAD_LEN + R
-
-            # 初始化位置变量（防止 draw 或 update 报错）
-            v.pos = 0  # 环岛内线性位置
-            v.current_angle = v.start_angle  # 环岛内实时角度
-
-            # 6. 初始化统计变量（用于 CSV 导出）
-            v.wait_time = 0  # 排队时长
-            v.conflict_count = 0  # 安全冲突次数
-
-            # 将新车加入列表
+            v.current_angle = v.start_angle
+            v.wait_time = 0
+            v.conflict_count = 0
             self.vehicles.append(v)
 
     def get_coords(self, v):
@@ -130,239 +145,58 @@ class AdvancedSim:
         total_speed = sum(v.v for v in self.vehicles)
         return total_speed / len(self.vehicles)
 
-    # def update(self):
-    #     R = 120
-    #     DT = 0.02
-    #     CENTER_X, CENTER_Y = 400, 400
-    #     LANE_OFFSET = 25
-    #
-    #     # 预筛选环岛内车辆，用于礼让
-    #     circulating_v = [v for v in self.vehicles if v.state in ["CIRCULATING", "ENTERING"]]
-    #
-    #     for v in self.vehicles[:]:
-    #         # 获取当前前车
-    #         lead_v = self.get_lead_vehicle(v)
-    #         # 调用你的 IDM 物理公式计算本帧加速度
-    #         v.a = v.update_acceleration(lead_v)
-    #         # --- 强行解冻逻辑 ---
-    #         if v.v < 0.1:  # 如果车已经停了
-    #             # 如果前面没有 lead_v，或者 lead_v 离得很远（比如 > 50 像素）
-    #             if not lead_v or (v.dist_to_center - lead_v.dist_to_center > 50):
-    #                 # 且不是因为礼让环岛而停下
-    #                 if v.state != "APPROACHING" or not self.check_ring_conflict(v):
-    #                     v.a = max(v.a, 0.5)  # 强行给一个起步加速度
-    #         # 应用加速度更新速度
-    #         v.v += v.a * DT
-    #         # 严禁倒车：如果 v 变成负数，强制归零
-    #         if v.v < 0.05:
-    #             v.v = 0
-    #             v.a = max(0, v.a)  # 既然停了，就不再允许继续施加负加速度
-    #         # 状态机处理位移
-    #         if v.state == "APPROACHING":
-    #             # 环岛礼让逻辑
-    #             is_blocked = False
-    #             if v.dist_to_center < R + 80:
-    #                 for other in circulating_v:
-    #                     d_angle = (v.start_angle - other.current_angle) % (2 * np.pi)
-    #                     if 0 < d_angle < 0.7:
-    #                         is_blocked = True
-    #                         break
-    #
-    #             if is_blocked and v.dist_to_center < R + 45:
-    #                 v.v = max(0, v.v - 4.0 * DT * 60)  # 强制刹车
-    #                 if v.v < 0.1: v.v = 0
-    #             else:
-    #                 v.v = max(0, v.v + v.a * DT)
-    #
-    #             v.dist_to_center -= v.v * DT
-    #             if v.dist_to_center <= R + 70 and not is_blocked:
-    #                 # 记录切换前的最后一刻坐标
-    #                 last_x, last_y = v.visual_x, v.visual_y
-    #                 v.state = "ENTERING"
-    #                 v.entry_path = self.generate_entry_path(v, R)
-    #                 # 【衔接补丁】：强制让路径的起点等于车辆当前坐标
-    #                 # 这样即便 generate_entry_path 有微小偏差，第一帧也不会跳变
-    #                 v.entry_path[0] = (last_x, last_y)
-    #                 v.path_index = 0
-    #                 continue
-    #
-    #
-    #         elif v.state == "ENTERING":
-    #             v.v = min(v.v, 6.0)
-    #             v.v = max(v.v + v.a * DT, 1.5)  # 保底给 1.0 速度，防止在弧线上冻死
-    #
-    #             # 关键：根据物理速度计算索引增加多少，而不是 +1
-    #
-    #             # 假设你的 path 点间距大约是 2 像素，如果点很密就除以更大的数
-    #             v.path_index += 1
-    #
-    #             idx = int(v.path_index)
-    #
-    #             if idx < len(v.entry_path) - 1:
-    #
-    #                 v.visual_x, v.visual_y = v.entry_path[idx]
-    #
-    #                 # 同步坐标给 IDM 判定
-    #
-    #                 dx, dy = v.visual_x - 400, v.visual_y - 400
-    #
-    #                 v.current_angle = math.atan2(dy, dx)
-    #
-    #                 # 角度平滑
-    #
-    #                 p_next = v.entry_path[min(idx + 1, len(v.entry_path) - 1)]
-    #
-    #                 v.angle_to_draw = math.atan2(p_next[1] - v.visual_y, p_next[0] - v.visual_x)
-    #
-    #             else:
-    #
-    #                 # 弧线走完，强行同步角度进入环岛
-    #
-    #                 # dx, dy = v.visual_x - 400, v.visual_y - 400
-    #                 #
-    #                 # v.current_angle = math.atan2(dy, dx)
-    #
-    #                 v.state = "CIRCULATING"
-    #
-    #                 continue
-    #
-    #         elif v.state == "CIRCULATING":
-    #             v.v = max(0, v.v + v.a * DT)
-    #             v.v = min(v.v, 15.0)
-    #             v.current_angle -= (v.v / (R + LANE_OFFSET)) * DT
-    #             v.current_angle %= (2 * np.pi)
-    #
-    #             angle_to_exit = (v.current_angle - v.end_angle) % (2 * np.pi)
-    #             if angle_to_exit < 0.2:
-    #                 v.state = "EXITING"
-    #                 v.exit_path = self.generate_exit_path(v, R)
-    #                 v.path_index = 0
-    #                 continue
-    #
-    #
-    #         elif v.state == "EXITING":
-    #
-    #             # 强制压制转弯速度，不许超过 5
-    #
-    #             v.v = min(v.v + v.a * DT, 5.0)
-    #
-    #             v.v = max(v.v, 1.0)  # 保底速度
-    #
-    #             # 降低 path_index 的增加速度。如果 0.5 还是快，就改成 0.3
-    #
-    #             v.path_index += 0.5
-    #
-    #             idx = int(v.path_index)
-    #
-    #             if idx < len(v.exit_path):
-    #
-    #                 v.visual_x, v.visual_y = v.exit_path[idx]
-    #
-    #                 # 更新 current_angle 和 dist_to_center 供 IDM 使用
-    #
-    #                 dx, dy = v.visual_x - 400, v.visual_y - 400
-    #
-    #                 v.dist_to_center = math.sqrt(dx ** 2 + dy ** 2)
-    #
-    #                 v.current_angle = math.atan2(dy, dx)
-    #
-    #             else:
-    #
-    #                 v.state = "STRAIGHT_OUT"
-    #
-    #                 continue
-    #
-    #         elif v.state == "STRAIGHT_OUT":
-    #             v.v = max(0, v.v + v.a * DT)
-    #             v.dist_to_center += v.v * DT
-    #
-    #             exit_angle = v.end_angle
-    #             v.visual_x = CENTER_X + v.dist_to_center * math.cos(exit_angle) - LANE_OFFSET * math.sin(exit_angle)
-    #             v.visual_y = CENTER_Y + v.dist_to_center * math.sin(exit_angle) + LANE_OFFSET * math.cos(exit_angle)
-    #             v.angle_to_draw = exit_angle
-    #
-    #             if v.dist_to_center > 1000:
-    #                 if v in self.vehicles: self.vehicles.remove(v)
-    #
-    #         # 同步逻辑坐标
-    #         if v.state in ["APPROACHING", "CIRCULATING"]:
-    #             self.get_coords(v)
-
     def update(self):
         R = 120
         DT = 0.02
         CENTER_X, CENTER_Y = 400, 400
         LANE_OFFSET = 25
-        STOP_LINE_DISTANCE = 175  # 停止线位置
+        STOP_LINE_DISTANCE = 175
 
-        # --- 补回 15 辆车限制 ---
-        # 如果当前车数超过 15 辆，就暂时停止生成新车（这通常在 spawn 函数里处理）
-        # 这里我们也做个安全检查，确保不会因为车太多导致系统崩溃
-        if len(self.vehicles) > 15:
-            # 如果你发现依然停死，可以尝试在这里减慢全局车速或增加礼让间距
-            pass
+        # 计算环岛内的活跃车辆数
+        in_ring_count = len([veh for veh in self.vehicles if veh.state in ["ENTERING", "CIRCULATING", "EXITING"]])
 
         for v in self.vehicles[:]:
             # 1. 基础物理更新
             lead_v = self.get_lead_vehicle(v)
             v.a = v.update_acceleration(lead_v)
 
-            # 强行解冻：只要前面没车或很远，且不用礼让，就给个力
-            if v.v < 0.1:
-                # 检查距离 (s) 是否足够
-                dist_to_lead = 1000
-                if lead_v:
-                    if v.state == "APPROACHING":
-                        dist_to_lead = v.dist_to_center - lead_v.dist_to_center
-                    elif v.state == "CIRCULATING":
-                        dist_to_lead = (v.current_angle - lead_v.current_angle) % (2 * math.pi) * R
-
-                if dist_to_lead > 45:  # 如果前方有超过一个车身的空隙
+            # 强行起步补丁
+            if v.v < 0.2:
+                if not lead_v or (v.state == "APPROACHING" and v.dist_to_center - lead_v.dist_to_center > 55):
                     if v.state != "APPROACHING" or not self.check_ring_conflict(v):
-                        v.a = max(v.a, 0.6)
+                        v.a = max(v.a, 0.8)
 
             v.v += v.a * DT
             v.v = max(0, v.v)
 
-            # 2. 状态机逻辑
+            # 2. 状态机
             if v.state == "APPROACHING":
-                # 核心修正：等候时不但看环岛，也要看前车
-                # 如果前车还没走，或者环岛有车，就停下
-                needs_to_stop = self.check_ring_conflict(v)
+                # 入场门槛：环岛内小于 15 辆 且 门口没车
+                can_enter_ring = (in_ring_count < 15) and (not self.check_ring_conflict(v))
 
-                # 如果前面已经有车在排队（lead_v 离中心更近）
+                # 判定前车：如果前车在停止线没走，我也不能动
                 if lead_v and (v.dist_to_center - lead_v.dist_to_center < 50):
-                    needs_to_stop = True
-
-                count_limit_ok = len(self.vehicles) < 15
-                no_conflict = not self.check_ring_conflict(v)
-
-                # 重新计算场内实时车数（排除已经在 STRAIGHT_OUT 准备消失的车）
-                active_vehicles = [veh for veh in self.vehicles if veh.state != "STRAIGHT_OUT"]
-                count_limit_ok = len(active_vehicles) < 15
-                no_conflict = not self.check_ring_conflict(v)
+                    can_enter_ring = False
 
                 if v.dist_to_center <= STOP_LINE_DISTANCE:
-                    if count_limit_ok and no_conflict:
-                        # --- 唤醒补丁 ---
+                    if can_enter_ring:
                         v.state = "ENTERING"
                         v.entry_path = self.generate_entry_path(v, R)
                         v.path_index = 0
-                        v.v = max(v.v, 2.0)  # 进场瞬间给个初速度，防止死在起步线上
+                        v.v = max(v.v, 2.5)  # 瞬时速度，防止卡死
+                        in_ring_count += 1  # 实时更新计数
                         continue
                     else:
                         v.v = 0
-                        v.a = 0
                         v.dist_to_center = STOP_LINE_DISTANCE
                 else:
-                    # 还没到停止线，正常行驶
-                    v.dist_to_center -= max(v.v, 0.5) * DT  # 给个极小的保底位移，防止在直线段冻死
+                    v.dist_to_center -= v.v * DT
 
+                # 同步位置
                 self.get_coords(v)
-                v.angle_to_draw = v.start_angle
 
             elif v.state == "ENTERING":
-                v.v = min(max(v.v, 1.8), 6.0)  # 略微提高保底速度到 1.8，防止在路口犹豫
+                v.v = min(max(v.v, 2.0), 6.0)  # 转弯保底 2.0
                 v.path_index += 0.8
                 idx = int(v.path_index)
                 if idx < len(v.entry_path) - 1:
@@ -375,55 +209,37 @@ class AdvancedSim:
                     v.state = "CIRCULATING"
 
             elif v.state == "CIRCULATING":
-                v.v = min(v.v, 10.0)
+                v.v = max(v.v, 3.0)
+                v.v = min(v.v, 12.0)
                 v.current_angle -= (v.v / (R + LANE_OFFSET)) * DT
                 v.current_angle %= (2 * np.pi)
                 self.get_coords(v)
                 v.angle_to_draw = v.current_angle - math.pi / 2
 
+                # 检查是否到出口
                 angle_to_exit = (v.current_angle - v.end_angle) % (2 * np.pi)
-                if angle_to_exit < 0.3:
+                if angle_to_exit < 0.25:
                     v.state = "EXITING"
                     v.exit_path = self.generate_exit_path(v, R)
                     v.path_index = 0
-                    continue
-
 
             elif v.state == "EXITING":
-
-                # --- 强行清场补丁 ---
-
-                # 在离场弧线上，我们不再完全依赖 v.a (IDM)
-
-                # 只要进入了退出程序，就给它一个恒定的退出速度，不许停！
-
-                v.v = max(v.v, 2.0)  # 强制最小速度 2.0，哪怕前面有车也慢慢蹭出去
-
-                v.v = min(v.v, 5.0)  # 同时限速，防止飞出去
-
+                v.v = max(v.v, 2.5)  # 强行排空，出口车就是大爷
                 v.path_index += 0.8
-
                 idx = int(v.path_index)
-
                 if idx < len(v.exit_path) - 1:
-
                     v.visual_x, v.visual_y = v.exit_path[idx]
-
                     p_next = v.exit_path[idx + 1]
-
                     v.angle_to_draw = math.atan2(p_next[1] - v.visual_y, p_next[0] - v.visual_x)
-
-                    dx, dy = v.visual_x - 400, v.visual_y - 400
-
+                    dx, dy = v.visual_x - CENTER_X, v.visual_y - CENTER_Y
                     v.dist_to_center = math.sqrt(dx ** 2 + dy ** 2)
-
                 else:
-
                     v.state = "STRAIGHT_OUT"
 
             elif v.state == "STRAIGHT_OUT":
                 v.dist_to_center += v.v * DT
                 exit_angle = v.end_angle
+                # 重新计算坐标防止漂移
                 v.visual_x = CENTER_X + v.dist_to_center * math.cos(exit_angle) - LANE_OFFSET * math.sin(exit_angle)
                 v.visual_y = CENTER_Y + v.dist_to_center * math.sin(exit_angle) + LANE_OFFSET * math.cos(exit_angle)
                 v.angle_to_draw = exit_angle
@@ -500,11 +316,11 @@ class AdvancedSim:
 
     def check_ring_conflict(self, v):
         for other in self.vehicles:
-            if other.state in ["CIRCULATING", "ENTERING"]:
+            if other.state in ["CIRCULATING", "ENTERING", "EXITING"]:
                 # 计算环岛车相对于我入场点的角度差
                 d_angle = (v.start_angle - other.current_angle) % (2 * math.pi)
-                # 0.4 弧度大约是 20 度，只要它不在我正前方这 20 度内，我就敢进！
-                if 0 < d_angle < 0.4:
+                # 0.3 弧度大约是 20 度，只要它不在我正前方这 20 度内，我就敢进！
+                if d_angle < 0.5 or d_angle > (2 * math.pi - 0.2):
                     return True
         return False
 
@@ -515,26 +331,26 @@ class AdvancedSim:
         for other in self.vehicles:
             if v == other: continue
 
-            # --- 核心逻辑：空间隔离 ---
             if v.state in ["ENTERING", "CIRCULATING", "EXITING"]:
-                # 环岛内的车，只看同样在环岛系统里的车
                 if other.state not in ["ENTERING", "CIRCULATING", "EXITING"]:
                     continue
 
-                # 这里的 R 对应你的环岛半径 120
+                # 逆时针环岛：前车的角度比我小
+                # 计算 (我的角度 - 他的角度) % 2pi 得到的是我到他的顺时针距离
+                # 在逆时针坐标系下，这正是我们要的前向弧长角度
                 d_angle = (v.current_angle - other.current_angle) % (2 * math.pi)
-                if 0 < d_angle < 0.6:  # 只看前方 35 度
-                    dist = d_angle * 120
+
+                # 只关注前方 0.8 弧度（约 45 度）内的车，防止误判身后的车
+                if 0 < d_angle < 0.8:
+                    dist = d_angle * 145.0  # 使用车道半径
                     if dist < min_dist:
                         min_dist, lead_v = dist, other
 
             elif v.state == "APPROACHING":
-                # 引道上的车，只看同路口且同样在引道上的前车
                 if other.state == "APPROACHING" and v.start_angle == other.start_angle:
                     dist = v.dist_to_center - other.dist_to_center
                     if 0 < dist < min_dist:
                         min_dist, lead_v = dist, other
-
         return lead_v
 
     def _draw_roundabout(self):
@@ -581,7 +397,10 @@ class AdvancedSim:
 
         for v in self.vehicles:
             x, y = self.get_coords(v)
-
+            # 显示车辆速度
+            # font = pygame.font.SysFont("Arial", 12)
+            # txt = font.render(f"{v.state} v:{v.v:.1f}", True, (255, 255, 255))
+            # self.screen.blit(txt, (v.visual_x, v.visual_y - 20))
             # --- 核心：计算车辆朝向 (Heading) ---
             # 进场和出场朝向是固定的角度，环岛内朝向是切线方向
             if v.state == "APPROACHING":
@@ -637,6 +456,52 @@ class AdvancedSim:
             txt_surface = font.render(text, True, color)
             screen.blit(txt_surface, (20, 20 + i * 25))
 
+    def draw_controls(self):
+        # 定义面板宽度和高度
+        panel_width = 320
+        panel_height = 140
+        # 计算起始位置 (右上角，留 10 像素边距)
+        start_x = SCREEN_SIZE - panel_width - 10
+        start_y = 10
+
+        try:
+            font = pygame.font.SysFont("SimHei", 20)
+        except:
+            font = pygame.font.SysFont("arial", 20)
+
+        # 1. 绘制半透明背景板
+        s = pygame.Surface((panel_width, panel_height))
+        s.set_alpha(150)  # 稍微深一点，看得清楚
+        s.fill((0, 0, 0))
+        self.screen.blit(s, (start_x, start_y))
+
+        # 2. 准备文字
+        agg_text = font.render(f"激进车权重 (Q+/A-): {self.weight_aggressive}", True, RED)
+        con_text = font.render(f"保守车权重 (W+/S-): {self.weight_conservative}", True, BLUE)
+
+        total_w = self.weight_aggressive + self.weight_conservative
+        ratio_val = (self.weight_aggressive / total_w * 100) if total_w > 0 else 0
+        ratio_text = font.render(f"当前激进比例: {ratio_val:.1f}%", True, WHITE)
+
+        # 3. 绘制文字到对应位置
+        self.screen.blit(agg_text, (start_x + 10, start_y + 10))
+        self.screen.blit(con_text, (start_x + 10, start_y + 40))
+        self.screen.blit(ratio_text, (start_x + 10, start_y + 70))
+
+        # 4. 绘制彩色比例条
+        bar_width = panel_width - 40
+        bar_x = start_x + 20
+        bar_y = start_y + 105
+
+        if total_w > 0:
+            agg_fill = (self.weight_aggressive / total_w) * bar_width
+            # 底色（保守车部分）
+            pygame.draw.rect(self.screen, BLUE, (bar_x, bar_y, bar_width, 15))
+            # 覆盖色（激进车部分）
+            pygame.draw.rect(self.screen, RED, (bar_x, bar_y, agg_fill, 15))
+            # 外边框
+            pygame.draw.rect(self.screen, WHITE, (bar_x, bar_y, bar_width, 15), 1)
+
     def export_data(self):
         """将所有统计数据导出为 CSV"""
         # 合并数据：已离开的车辆 + 当前还在场上的车辆
@@ -678,7 +543,12 @@ class AdvancedSim:
                 # S 键保存数据
                 if event.key == pygame.K_s:
                     self.export_data()
-
+                # 按 Q/A 调激进车比例
+                if event.key == pygame.K_q: self.weight_aggressive += 1
+                if event.key == pygame.K_a: self.weight_aggressive = max(0, self.weight_aggressive - 1)
+                # 按 W/S 调保守车比例
+                if event.key == pygame.K_w: self.weight_conservative += 1
+                if event.key == pygame.K_s: self.weight_conservative = max(0, self.weight_conservative - 1)
                 # --- 实验参数实时调整 ---
                 # 1 & 2: 调整最高速
                 if event.key == pygame.K_1:
@@ -718,6 +588,7 @@ class AdvancedSim:
             # 4. 绘图渲染
             self.draw()  # 画背景、道路和车辆
             self.draw_dashboard(self.screen)  # 在最上层画仪表盘
+            self.draw_controls()
             # --- 调试绘图开始 ---
             # 必须遍历 self.vehicles 才能拿到每一辆车 v
             # for v in self.vehicles:

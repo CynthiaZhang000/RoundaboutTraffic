@@ -34,63 +34,55 @@ class Vehicle:
         self.visual_y = None
 
     def update_acceleration(self, lead_vehicle):
-        # --- 1. 基础参数获取 ---
-        # 自动适配 a 或 a_max，b 为减速度，v0 为期望速度
-        max_accel = getattr(self, 'a_max', getattr(self, 'a', 1.5))
-        s0 = getattr(self, 's0', 10)  # 静止安全距离
-        T = getattr(self, 'T', 1.5)  # 时间安全距离
-        b = getattr(self, 'b', 1.5)  # 舒适减速度
+        max_accel = getattr(self, 'a_max', 1.5)
+        s0 = getattr(self, 's0', 10)
+        T = getattr(self, 'T', 1.5)
+        b = getattr(self, 'b', 1.5)
 
-        s = 1000.0  # 默认前方无车，间距无穷大
+        s = 1000.0
         delta_v = 0.0
 
-        # --- 2. 距离计算逻辑 ---
         if lead_vehicle:
             if self.state in ["ENTERING", "CIRCULATING", "EXITING"]:
-                # 环岛内：通过弧度差计算距离 (半径 120)
-                # 使用 % (2*pi) 确保永远是正向间距
+                # 环岛内距离计算：弧长
                 angle_diff = (self.current_angle - lead_vehicle.current_angle) % (2 * math.pi)
-                s = angle_diff * 120.0
+                # 如果算出来 angle_diff 太接近 2pi，说明前车就在屁股后面，间距应该是极小的正数
+                if angle_diff > math.pi: angle_diff = 0.1
+                s = angle_diff * 145.0  # 使用外圈半径计算更准确
             elif self.state == "APPROACHING":
-                # 进场直线：车头对车尾
                 s = self.dist_to_center - lead_vehicle.dist_to_center
-            elif self.state == "STRAIGHT_OUT":
-                # 出场直线：车尾对车头
-                s = lead_vehicle.dist_to_center - self.dist_to_center
 
-            # 速度差（我比前车快多少）
             delta_v = self.v - lead_vehicle.v
+            # 补偿车身长度：40 像素是安全值
+            s -= 45.0
 
-            # 【关键修正】车辆长度补偿：调小一点（30-35）能让车流更紧凑，不易锁死
-            s -= 30.0
+        s = max(s, 2.0)  # 严禁距离变成 0
 
-            # --- 3. IDM 核心公式计算 ---
-        # 确保 s 永远不为 0 或负数，防止除法报错
-        s = max(s, 1.0)
+        if s < 10.0:  # 极其危险距离
+            if delta_v > 0:  # 且我比前车快
+                return -self.b * 4.0  # 强制紧急刹车
+            else:
+                return 0  # 已经慢下来了，保持静止
 
-        # 自由加速项
+        # IDM 核心公式
         accel_free = max_accel * (1 - (max(0, self.v) / self.v0) ** 4)
-
-        # 交互项（跟车项）
         s_star = s0 + max(0, self.v * T + (self.v * delta_v) / (2 * math.sqrt(max_accel * b)))
         accel_int = -max_accel * (s_star / s) ** 2
 
         total_accel = accel_free + accel_int
 
-        # --- 4. 强制防御补丁（解决“走一走就不动”的问题） ---
+        # --- 【关键疏通逻辑】 ---
+        # 如果车辆在环岛系统内（非直线排队态），且速度极低
+        if self.state in ["ENTERING", "CIRCULATING", "EXITING"]:
+            if self.v < 1.0:
+                # 只要前面有 15 像素（约半个车身）的空隙，强制给加速度起步
+                if s > 15.0:
+                    total_accel = 1.0
+                else:
+                    total_accel = 0  # 实在贴太近了才停
 
-        # A. 彻底死锁保护：如果前方其实有空间（s > 15），但 IDM 依然算不出正数
-        if self.v < 0.2 and s > 15.0:
-            total_accel = max(total_accel, 0.8)  # 强行给一个起步推力
-
-        # B. 倒车保护：如果已经停了，就不再允许负加速度
+        # 严禁倒车
         if self.v <= 0 and total_accel < 0:
             total_accel = 0
 
-        # C. 极端情况：如果距离太近（s < 2），强制刹车
-        if s < 2.0:
-            total_accel = -b * 2.0
-        if self.v < 0.1 and s > 10:  # 只要前面有 10 像素空隙
-            return 0.5  # 强行给个起步速度
-        # 最终限幅
-        return max(-b * 2.5, min(max_accel, total_accel))
+        return max(-b * 3, min(max_accel, total_accel))
