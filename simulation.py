@@ -1,8 +1,14 @@
+import os
+import sys
 import csv
+from datetime import datetime
 import math
 import pygame
 import numpy as np
 import random
+import matplotlib.pyplot as plt
+import matplotlib
+import seaborn as sns  # 如果没有 sns 就用 plt.hist
 from vehicle import Vehicle
 
 # --- 增强版常量 ---
@@ -24,6 +30,8 @@ BLUE = (50, 50, 200)  # 保守
 
 class AdvancedSim:
     def __init__(self):
+        if not os.path.exists('report'):
+            os.makedirs('report')
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_SIZE, SCREEN_SIZE))
         self.clock = pygame.time.Clock()
@@ -31,7 +39,6 @@ class AdvancedSim:
         self.spawn_timer = 0
         # 入口/出口角度定义: 0:右, pi/2:下, pi:左, 3pi/2:上
         self.directions = [0, np.pi / 2, np.pi, 3 * np.pi / 2]
-        # self.directions = [np.pi / 2, 3 * np.pi / 2]
 
         self.vehicles = []
         self.data_logs = []  # 新增：用于存放已离开车辆的数据
@@ -52,6 +59,7 @@ class AdvancedSim:
         }
 
         # 数据统计容器
+        self.data_logs = []
         self.stats_travel_times = []  # 存储每张车完成通行的总时间
         self.stats_conflicts = []  # 存储所有冲突点的坐标 (x, y)
         self.stats_flow_data = []  # 存储 (当前车数, 瞬时效率/吞吐量)
@@ -165,6 +173,7 @@ class AdvancedSim:
                 if not lead_v or (v.state == "APPROACHING" and v.dist_to_center - lead_v.dist_to_center > 55):
                     if v.state != "APPROACHING" or not self.check_ring_conflict(v):
                         v.a = max(v.a, 0.8)
+                self.wait_time += 0.016
 
             v.v += v.a * DT
             v.v = max(0, v.v)
@@ -245,7 +254,29 @@ class AdvancedSim:
                 v.angle_to_draw = exit_angle
 
                 if v.dist_to_center > 1000:
+                    self.stats_travel_times.append(v.wait_time + v.enter_time)  # 或者是你定义的统计字段
                     if v in self.vehicles: self.vehicles.remove(v)
+
+                duration = (pygame.time.get_ticks() - v.spawn_time) / 1000.0  # 转换为秒
+                self.stats_travel_times.append(duration)
+
+                # --- 2. 写入档案库 (关键：修复数据为空的问题) ---
+                self.data_logs.append({
+                    'id': v.id,
+                    'type': v.type,
+                    'travel_time': round(duration, 2),
+                    'wait_time': round(v.wait_time, 2),
+                    'conflicts': v.conflict_count,
+                    'status': 'completed'
+                })
+
+        # 统计效率
+        active_ring_vehicles = [v for v in self.vehicles if v.state == "CIRCULATING"]
+        flow_count = len(active_ring_vehicles)
+        if flow_count > 0:
+            avg_speed = sum([v.v for v in active_ring_vehicles]) / flow_count
+            self.stats_flow_data.append((flow_count, avg_speed))
+
 
     def generate_entry_path(self, v, R):
         CENTER = 400
@@ -321,6 +352,7 @@ class AdvancedSim:
                 d_angle = (v.start_angle - other.current_angle) % (2 * math.pi)
                 # 0.3 弧度大约是 20 度，只要它不在我正前方这 20 度内，我就敢进！
                 if d_angle < 0.5 or d_angle > (2 * math.pi - 0.2):
+                    self.stats_conflicts.append((v.visual_x, v.visual_y))
                     return True
         return False
 
@@ -457,98 +489,191 @@ class AdvancedSim:
             screen.blit(txt_surface, (20, 20 + i * 25))
 
     def draw_controls(self):
-        # 定义面板宽度和高度
+        # 1. 设置面板的基础坐标和大小
         panel_width = 320
-        panel_height = 140
-        # 计算起始位置 (右上角，留 10 像素边距)
+        panel_height = 165
         start_x = SCREEN_SIZE - panel_width - 10
         start_y = 10
 
+        # 2. 获取数据（确保 self.weight_aggressive 这些变量已经存在）
+        w_agg = self.weight_aggressive
+        w_con = self.weight_conservative
+        total_w = w_agg + w_con
+        ratio_percent = (w_agg / total_w * 100) if total_w > 0 else 0
+
+        # 3. 准备字体 (在这里统一定义，解决“不认识”的问题)
         try:
-            font = pygame.font.SysFont("SimHei", 20)
+            # 优先使用中文字体，没有就用系统默认
+            main_font = pygame.font.SysFont("SimHei", 20)
+            hint_font = pygame.font.SysFont("SimHei", 16)  # 这就是你要的 small font
         except:
-            font = pygame.font.SysFont("arial", 20)
+            main_font = pygame.font.SysFont("arial", 18)
+            hint_font = pygame.font.SysFont("arial", 14)
 
-        # 1. 绘制半透明背景板
-        s = pygame.Surface((panel_width, panel_height))
-        s.set_alpha(150)  # 稍微深一点，看得清楚
-        s.fill((0, 0, 0))
-        self.screen.blit(s, (start_x, start_y))
+        # 4. 绘制半透明背景面板
+        overlay = pygame.Surface((panel_width, panel_height))
+        overlay.set_alpha(180)
+        overlay.fill((0, 0, 0))
+        self.screen.blit(overlay, (start_x, start_y))
 
-        # 2. 准备文字
-        agg_text = font.render(f"激进车权重 (Q+/A-): {self.weight_aggressive}", True, RED)
-        con_text = font.render(f"保守车权重 (W+/S-): {self.weight_conservative}", True, BLUE)
+        # 5. 画边框
+        pygame.draw.rect(self.screen, (200, 200, 200), (start_x, start_y, panel_width, panel_height), 2)
 
-        total_w = self.weight_aggressive + self.weight_conservative
-        ratio_val = (self.weight_aggressive / total_w * 100) if total_w > 0 else 0
-        ratio_text = font.render(f"当前激进比例: {ratio_val:.1f}%", True, WHITE)
+        # 6. 渲染并绘制文字
+        # 激进权重
+        txt_agg = main_font.render(f"激进权重 (UP+/DOWN-): {w_agg}", True, (255, 50, 50))
+        self.screen.blit(txt_agg, (start_x + 20, start_y + 15))
 
-        # 3. 绘制文字到对应位置
-        self.screen.blit(agg_text, (start_x + 10, start_y + 10))
-        self.screen.blit(con_text, (start_x + 10, start_y + 40))
-        self.screen.blit(ratio_text, (start_x + 10, start_y + 70))
+        # 保守权重
+        txt_con = main_font.render(f"保守权重 (RIGHT+/LEFT-): {w_con}", True, (80, 80, 255))
+        self.screen.blit(txt_con, (start_x + 20, start_y + 45))
 
-        # 4. 绘制彩色比例条
-        bar_width = panel_width - 40
-        bar_x = start_x + 20
-        bar_y = start_y + 105
+        # 比例显示
+        txt_ratio = main_font.render(f"生成倾向: {ratio_percent:.1f}% 激进", True, (255, 255, 255))
+        self.screen.blit(txt_ratio, (start_x + 20, start_y + 75))
+
+        # 底部提示文字 (使用刚才定义的 hint_font)
+        # txt_hint = hint_font.render("按 [空格键] 生成统计分析图表", True, (200, 200, 200))
+        # self.screen.blit(txt_hint, (start_x + 20, start_y + 135))
+        self.screen.blit(hint_font.render("按 [数字 8] 汇统计图，导出 CSV 数据", True, (0, 255, 255)),
+                         (start_x + 20, start_y + 135))
+
+        # 7. 绘制彩色进度条
+        bar_x, bar_y = start_x + 20, start_y + 110
+        bar_w, bar_h = panel_width - 40, 15
 
         if total_w > 0:
-            agg_fill = (self.weight_aggressive / total_w) * bar_width
-            # 底色（保守车部分）
-            pygame.draw.rect(self.screen, BLUE, (bar_x, bar_y, bar_width, 15))
-            # 覆盖色（激进车部分）
-            pygame.draw.rect(self.screen, RED, (bar_x, bar_y, agg_fill, 15))
-            # 外边框
-            pygame.draw.rect(self.screen, WHITE, (bar_x, bar_y, bar_width, 15), 1)
+            red_w = (w_agg / total_w) * bar_w
+            # 底色蓝色
+            pygame.draw.rect(self.screen, (50, 50, 200), (bar_x, bar_y, bar_w, bar_h))
+            # 覆盖红色
+            pygame.draw.rect(self.screen, (200, 50, 50), (bar_x, bar_y, red_w, bar_h))
+            # 白色细边框
+            pygame.draw.rect(self.screen, (255, 255, 255), (bar_x, bar_y, bar_w, bar_h), 1)
+
+    def plot_results(self):
+        matplotlib.use('TkAgg')
+
+        if not self.stats_travel_times:
+            print("警告：目前还没有车辆完成通行，没有数据可画！")
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # 1. 通行时间分布图 (Histogram)
+        axes[0].hist(self.stats_travel_times, bins=20, color='skyblue', edgecolor='black')
+        axes[0].set_title("Travel Time Distribution")
+        axes[0].set_xlabel("Time (s)")
+        axes[0].set_ylabel("Vehicle Count")
+
+        # 2. 冲突热力图 (Heatmap/Scatter)
+        if self.stats_conflicts:
+            cx, cy = zip(*self.stats_conflicts)
+            hb = axes[1].hexbin(cx, cy, gridsize=30, cmap='YlOrRd', extent=[0, 800, 0, 800])
+            axes[1].set_title("Conflict Heatmap (Real Position)")
+            axes[1].invert_yaxis()  # 匹配 Pygame 的 Y 轴向下增长
+            # 画一个环岛轮廓方便对比
+            circle = plt.Circle((400, 400), 120, color='blue', fill=False, linestyle='--')
+            axes[1].add_artist(circle)
+
+        # 3. 流量-效率关系图 (Scatter/Line)
+        if self.stats_flow_data:
+            flows, effs = zip(*self.stats_flow_data)
+            axes[2].scatter(flows, effs, alpha=0.5)
+            axes[2].set_title("Flow vs Efficiency")
+            axes[2].set_xlabel("Number of Vehicles")
+            axes[2].set_ylabel("Avg Speed (Efficiency)")
+
+        plt.tight_layout()
+        plt.show()
+
+        output_path = os.path.join('report', 'simulation_plots.png')
+        plt.savefig(output_path, dpi=300)
+        # plt.close()  # 记得关闭，防止内存占用
+        print(f"✅ 统计图表已保存至: {output_path}")
 
     def export_data(self):
         """将所有统计数据导出为 CSV"""
-        # 合并数据：已离开的车辆 + 当前还在场上的车辆
-        final_list = list(self.data_logs)  # 复制一份档案库
+        # 1. 整合已离开和还在场上的车辆
+        final_list = list(self.data_logs)
 
         for v in self.vehicles:
             final_list.append({
                 'id': v.id,
                 'type': v.type,
+                'travel_time': round((pygame.time.get_ticks() - v.spawn_time) / 1000.0, 2),
                 'wait_time': round(v.wait_time, 2),
-                'conflicts': v.conflict_count,  # <-- 这里也要加，否则报错
-                'status': 'in_sim'
+                'conflicts': v.conflict_count,
+                'status': 'still_in_simulation'
             })
 
         if not final_list:
-            print("没有记录到任何车辆数据！")
+            print("没有记录到任何车辆数据，无法导出！")
             return
 
-        filename = "traffic_research_results.csv"
-        keys = final_list[0].keys()
+        filename = os.path.join('report', f"traffic_analysis_{pygame.time.get_ticks()}.csv")
+
+        # 2. 这里的 keys 必须手动指定或确保 final_list 肯定有数据
+        keys = ['id', 'type', 'travel_time', 'wait_time', 'conflicts', 'status']
 
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 dict_writer = csv.DictWriter(f, fieldnames=keys)
                 dict_writer.writeheader()
                 dict_writer.writerows(final_list)
-            print(f"数据导出成功！文件名: {filename}")
+            print(f"数据已完整导出！共 {len(final_list)} 条记录。文件名: {filename}")
         except PermissionError:
-            print("错误：无法保存文件。请检查 CSV 文件是否被 Excel 打开了？")
+            print("错误：文件被占用，请先关闭正在查看该 CSV 的 Excel 窗口！")
+
+    def save_to_csv(self):
+
+        # 创建一个带时间戳的文件名，防止覆盖之前的实验
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 1. 保存流量-效率数据
+        flow_filename = os.path.join('report', f'flow_data_{timestamp}.csv')
+        with open(flow_filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Number_of_Vehicles', 'Avg_Speed_Efficiency'])
+            writer.writerows(self.stats_flow_data)
+
+        # 2. 保存通行时间数据
+        travel_filename = os.path.join('report', f'travel_time_{timestamp}.csv')
+        with open(travel_filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Travel_Time_Seconds'])
+            for t in self.stats_travel_times:
+                writer.writerow([t])
+
+        print(f"数据已导出到 CSV 文件！时间戳: {timestamp}")
 
     def handle_events(self):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 print("正在自动保存数据...")
                 self.export_data()
+                pygame.quit()  # 卸载 pygame 模块
+                sys.exit()  # 强制终止 Python 进程，防止窗口卡死
                 self.running = False  # 确保类里有 self.running 属性
 
             if event.type == pygame.KEYDOWN:
+                print(f"Key pressed: {event.key}")
                 # S 键保存数据
-                if event.key == pygame.K_s:
-                    self.export_data()
+                if event.key == pygame.K_8:
+                    print(">>> 正在导出全套研究数据至 report 文件夹...")
+                    self.export_data()  # 存详细档案
+                    self.save_to_csv()  # 存绘图原始数据
+                    self.plot_results()  # 存仿真图表
                 # 按 Q/A 调激进车比例
-                if event.key == pygame.K_q: self.weight_aggressive += 1
-                if event.key == pygame.K_a: self.weight_aggressive = max(0, self.weight_aggressive - 1)
+                if event.key == pygame.K_UP: self.weight_aggressive += 1
+                if event.key == pygame.K_DOWN: self.weight_aggressive = max(0, self.weight_aggressive - 1)
                 # 按 W/S 调保守车比例
-                if event.key == pygame.K_w: self.weight_conservative += 1
-                if event.key == pygame.K_s: self.weight_conservative = max(0, self.weight_conservative - 1)
+                if event.key == pygame.K_RIGHT: self.weight_conservative += 1
+                if event.key == pygame.K_LEFT: self.weight_conservative = max(0, self.weight_conservative - 1)
+
+                # if event.key == pygame.K_SPACE:  # 按 P 键弹出图表
+                #     print("--- 触发数据绘图 ---")
+                #     self.plot_results()
+                #     self.save_to_csv()
                 # --- 实验参数实时调整 ---
                 # 1 & 2: 调整最高速
                 if event.key == pygame.K_1:
@@ -572,44 +697,47 @@ class AdvancedSim:
     def run(self):
         # 移除多余的 clock = pygame.time.Clock()，使用 self.clock
         running = True
-        while running:
-            # 1. 专门处理所有输入事件
-            self.handle_events()
+        try:
+            while running:
+                # 1. 专门处理所有输入事件
+                self.handle_events()
 
-            # 2. 车辆生成逻辑
-            self.spawn_timer += 1
-            if self.spawn_timer > 15:
-                self.spawn_vehicle()
-                self.spawn_timer = 0
+                # 2. 车辆生成逻辑
+                self.spawn_timer += 1
+                if self.spawn_timer > 15:
+                    self.spawn_vehicle()
+                    self.spawn_timer = 0
 
-            # 3. 物理逻辑更新
-            self.update()
+                # 3. 物理逻辑更新
+                self.update()
 
-            # 4. 绘图渲染
-            self.draw()  # 画背景、道路和车辆
-            self.draw_dashboard(self.screen)  # 在最上层画仪表盘
-            self.draw_controls()
-            # --- 调试绘图开始 ---
-            # 必须遍历 self.vehicles 才能拿到每一辆车 v
-            # for v in self.vehicles:
-            #     # 只为处于 ENTERING 状态的车画出红点路径
-            #     if v.state == "ENTERING" and hasattr(v, 'entry_path'):
-            #         for p in v.entry_path:
-            #             # 使用 self.screen，并将坐标转为整数
-            #             pygame.draw.circle(self.screen, (255, 0, 0), (int(p[0]), int(p[1])), 2)
-            #
-            #     # 【额外建议】给每辆车画一个小绿点代表其 visual_x/y 的实时位置
-            #     # 如果绿点偏离了红点路径，说明 get_coords 正在干扰路径
-            #     pygame.draw.circle(self.screen, (0, 255, 0), (int(v.visual_x), int(v.visual_y)), 3)
+                # 4. 绘图渲染
+                self.draw()  # 画背景、道路和车辆
+                self.draw_dashboard(self.screen)  # 在最上层画仪表盘
+                self.draw_controls()
+                # --- 调试绘图开始 ---
+                # 必须遍历 self.vehicles 才能拿到每一辆车 v
+                # for v in self.vehicles:
+                #     # 只为处于 ENTERING 状态的车画出红点路径
+                #     if v.state == "ENTERING" and hasattr(v, 'entry_path'):
+                #         for p in v.entry_path:
+                #             # 使用 self.screen，并将坐标转为整数
+                #             pygame.draw.circle(self.screen, (255, 0, 0), (int(p[0]), int(p[1])), 2)
+                #
+                #     # 【额外建议】给每辆车画一个小绿点代表其 visual_x/y 的实时位置
+                #     # 如果绿点偏离了红点路径，说明 get_coords 正在干扰路径
+                #     pygame.draw.circle(self.screen, (0, 255, 0), (int(v.visual_x), int(v.visual_y)), 3)
 
-            # 画出环岛的理想轨道（绿色大圆圈），确认 lane_offset=25 是否对齐
-            # pygame.draw.circle(self.screen, (0, 255, 0), (400, 400), 120 + 25, 1)
-            # --- 调试绘图结束 ---
-            # 5. 刷新屏幕
-            pygame.display.flip()
-            self.clock.tick(60)
-
-        pygame.quit()
+                # 画出环岛的理想轨道（绿色大圆圈），确认 lane_offset=25 是否对齐
+                # pygame.draw.circle(self.screen, (0, 255, 0), (400, 400), 120 + 25, 1)
+                # --- 调试绘图结束 ---
+                # 5. 刷新屏幕
+                pygame.display.flip()
+                self.clock.tick(60)
+        except:
+            pass
+        finally:
+            pygame.quit()
 
 if __name__ == "__main__":
     sim = AdvancedSim()

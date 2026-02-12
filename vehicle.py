@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import pygame
 
 
 class Vehicle:
@@ -32,6 +33,8 @@ class Vehicle:
 
         self.visual_x = None
         self.visual_y = None
+
+        self.spawn_time = pygame.time.get_ticks()
 
     def update_acceleration(self, lead_vehicle):
         max_accel = getattr(self, 'a_max', 1.5)
